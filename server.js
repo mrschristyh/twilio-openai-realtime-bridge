@@ -1,6 +1,7 @@
 import express from 'express';
 import http from 'http';
 import { WebSocketServer } from 'ws';
+import { parse as parseUrl } from 'url';
 
 const app = express();
 const server = http.createServer(app);
@@ -8,14 +9,35 @@ const PORT = process.env.PORT || 10000;
 
 app.get('/', (_req, res) => res.send('OK'));
 
-const wss = new WebSocketServer({
-  server,
-  path: '/stream',
-  // ✅ Tell Twilio we speak its subprotocol
-  handleProtocols: (protocols) => {
-    if (protocols && protocols.includes('audio.twilio.com')) return 'audio.twilio.com';
-    return false; // reject if not Twilio
+// Use noServer + manual upgrade to select Twilio's subprotocol
+const wss = new WebSocketServer({ noServer: true });
+
+server.on('upgrade', (req, socket, head) => {
+  const { pathname } = parseUrl(req.url || '');
+  const protocols = (req.headers['sec-websocket-protocol'] || '')
+    .split(',')
+    .map(s => s.trim());
+
+  // Only accept on /stream and when Twilio offers audio.twilio.com
+  if (pathname !== '/stream' || !protocols.includes('audio.twilio.com')) {
+    socket.write('HTTP/1.1 400 Bad Request\r\n\r\n');
+    socket.destroy();
+    return;
   }
+
+  // Tell Twilio we selected the audio.twilio.com subprotocol
+  const responseHeaders = [
+    'HTTP/1.1 101 Switching Protocols',
+    'Upgrade: websocket',
+    'Connection: Upgrade',
+    'Sec-WebSocket-Protocol: audio.twilio.com'
+  ];
+
+  // Let ws finish the upgrade
+  wss.handleUpgrade(req, socket, head, (ws) => {
+    // ws.protocol will be 'audio.twilio.com'
+    wss.emit('connection', ws, req);
+  });
 });
 
 wss.on('connection', (twilioWs, req) => {
@@ -28,21 +50,16 @@ wss.on('connection', (twilioWs, req) => {
       return;
     }
 
-    // Twilio sends event types: 'start', 'media', 'stop', 'mark', etc.
     if (data.event === 'start') {
       console.log('Twilio stream started:', data.start.streamSid);
     }
 
     if (data.event === 'media') {
-      // ✅ Echo audio straight back to Twilio so you hear yourself (loopback test)
-      // This proves bidirectional audio works without touching OpenAI yet.
+      // Echo the incoming μ-law audio back to Twilio (loopback test)
       try {
         twilioWs.send(JSON.stringify({
           event: 'media',
-          media: {
-            // send the SAME base64 mulaw payload back
-            payload: data.media.payload
-          }
+          media: { payload: data.media.payload }
         }));
       } catch (e) {
         console.error('Echo send error:', e);
@@ -61,3 +78,4 @@ wss.on('connection', (twilioWs, req) => {
 server.listen(PORT, () => {
   console.log('Server listening on :' + PORT);
 });
+
