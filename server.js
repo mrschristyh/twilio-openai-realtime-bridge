@@ -9,28 +9,20 @@ const PORT = process.env.PORT || 10000;
 app.get('/', (_req, res) => res.send('OK'));
 app.get('/health', (_req, res) => res.json({ ok: true }));
 
-// We'll do manual upgrade to control subprotocol selection.
-const wss = new WebSocketServer({
-  noServer: true,
-  // This is honored by ws during handleUpgrade and sets Sec-WebSocket-Protocol in the 101 response.
-  handleProtocols: (protocols /*, request */) => {
-    // Twilio offers "audio.twilio.com" — pick it explicitly.
-    if (protocols && protocols.includes('audio.twilio.com')) return 'audio.twilio.com';
-    return false; // reject anything else
-  }
-});
+// Accept upgrades and DON'T enforce subprotocol; log everything.
+const wss = new WebSocketServer({ noServer: true, perMessageDeflate: false });
 
 server.on('upgrade', (req, socket, head) => {
   try {
-    // Use WHATWG URL to avoid url.parse deprecations
     const url = new URL(req.url || '/', `http://${req.headers.host || 'localhost'}`);
     const pathname = url.pathname;
-    const protocolsHdr = String(req.headers['sec-websocket-protocol'] || '');
-    const protocols = protocolsHdr.split(',').map(s => s.trim()).filter(Boolean);
+    const protoHdr = String(req.headers['sec-websocket-protocol'] || '');
+    const protocols = protoHdr.split(',').map(s => s.trim()).filter(Boolean);
 
     console.log('HTTP upgrade attempt:', {
       path: pathname,
-      protocolsOffered: protocols
+      protocolsOffered: protocols,
+      headers: req.headers,
     });
 
     if (pathname !== '/stream') {
@@ -38,14 +30,8 @@ server.on('upgrade', (req, socket, head) => {
       socket.destroy();
       return;
     }
-    if (!protocols.includes('audio.twilio.com')) {
-      // Twilio should always offer this; if not, tell us what it sent.
-      console.error('Missing required subprotocol "audio.twilio.com". Offered:', protocols);
-      socket.write('HTTP/1.1 400 Bad Request\r\n\r\n');
-      socket.destroy();
-      return;
-    }
 
+    // Proceed without forcing a subprotocol; Twilio should still accept if it doesn't care.
     wss.handleUpgrade(req, socket, head, (ws) => {
       wss.emit('connection', ws, req);
     });
@@ -64,13 +50,12 @@ wss.on('connection', (twilioWs, req) => {
     try { data = JSON.parse(msg.toString()); }
     catch (e) { console.error('Bad JSON from Twilio', e); return; }
 
-    // Expect events: start, media, mark, stop
     if (data.event === 'start') {
       console.log('Twilio stream started:', data.start?.streamSid);
     }
 
     if (data.event === 'media') {
-      // 🔊 Loopback: echo the same μ-law frame back so you hear yourself (proves WS path)
+      // Echo the same μ-law frame back (loopback)
       try {
         twilioWs.send(JSON.stringify({
           event: 'media',
