@@ -1,7 +1,9 @@
 import express from 'express';
 import { WebSocketServer } from 'ws';
 import WebSocket from 'ws';
-import { MuLaw } from 'alawmulaw';
+import alawmulaw from 'alawmulaw';
+const { MuLaw } = alawmulaw;
+
 
 const OPENAI_WS = 'wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview';
 const PORT = process.env.PORT || 8080;
