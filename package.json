@@ -1,0 +1,12 @@
+{
+  "name": "twilio-openai-realtime-bridge",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "express": "^4.19.2",
+    "ws": "^8.16.0",
+    "mulaw-js": "^1.0.3",
+    "wav": "^1.0.2",
+    "node-resampler": "^1.6.0"
+  }
+}
