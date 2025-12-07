@@ -160,3 +160,10 @@ wss.on('connection', async (twilioWs, req) => {
     try { aiWs.close(); } catch(_) {}
   });
 });
+wss.on('connection', async (twilioWs, req) => {
+  console.log('WS connection from Twilio:', req.url);   // <— add this
+  // ... existing code ...
+
+  twilioWs.on('error', (err) => console.error('Twilio WS error', err));
+  aiWs.on('error', (err) => console.error('OpenAI WS error', err));
+});
