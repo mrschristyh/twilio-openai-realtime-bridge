@@ -9,7 +9,7 @@ const PORT = process.env.PORT || 10000;
 app.get('/', (_req, res) => res.send('OK'));
 app.get('/health', (_req, res) => res.json({ ok: true }));
 
-// Accept upgrades and DON'T enforce subprotocol; log everything.
+// Tolerant WS upgrade: accept even if subprotocol header is missing.
 const wss = new WebSocketServer({ noServer: true, perMessageDeflate: false });
 
 server.on('upgrade', (req, socket, head) => {
@@ -19,11 +19,7 @@ server.on('upgrade', (req, socket, head) => {
     const protoHdr = String(req.headers['sec-websocket-protocol'] || '');
     const protocols = protoHdr.split(',').map(s => s.trim()).filter(Boolean);
 
-    console.log('HTTP upgrade attempt:', {
-      path: pathname,
-      protocolsOffered: protocols,
-      headers: req.headers,
-    });
+    console.log('HTTP upgrade attempt:', { path: pathname, protocolsOffered: protocols });
 
     if (pathname !== '/stream') {
       socket.write('HTTP/1.1 404 Not Found\r\n\r\n');
@@ -31,7 +27,7 @@ server.on('upgrade', (req, socket, head) => {
       return;
     }
 
-    // Proceed without forcing a subprotocol; Twilio should still accept if it doesn't care.
+    // Proceed without forcing a subprotocol; Twilio can still stream.
     wss.handleUpgrade(req, socket, head, (ws) => {
       wss.emit('connection', ws, req);
     });
@@ -45,29 +41,46 @@ server.on('upgrade', (req, socket, head) => {
 wss.on('connection', (twilioWs, req) => {
   console.log('WS connection from Twilio:', req.url, 'protocol=', twilioWs.protocol);
 
+  let streamSid = null;
+  let seq = 1;
+
   twilioWs.on('message', (msg) => {
     let data;
-    try { data = JSON.parse(msg.toString()); }
-    catch (e) { console.error('Bad JSON from Twilio', e); return; }
+    try { data = JSON.parse(msg.toString()); } catch (e) {
+      console.error('Bad JSON from Twilio', e);
+      return;
+    }
 
     if (data.event === 'start') {
-      console.log('Twilio stream started:', data.start?.streamSid);
+      streamSid = data.start?.streamSid || data.streamSid || null;
+      console.log('Twilio stream started:', streamSid);
+      return;
     }
 
     if (data.event === 'media') {
-      // Echo the same μ-law frame back (loopback)
+      if (!streamSid) return;
+      // Echo the same μ-law frame back (loopback test)
       try {
         twilioWs.send(JSON.stringify({
           event: 'media',
+          streamSid,                   // REQUIRED for Twilio to play audio
           media: { payload: data.media.payload }
+        }));
+        // optional marker so you can see progress
+        twilioWs.send(JSON.stringify({
+          event: 'mark',
+          streamSid,
+          mark: { name: `echo-${seq++}` }
         }));
       } catch (e) {
         console.error('Echo send error:', e);
       }
+      return;
     }
 
     if (data.event === 'stop') {
       console.log('Twilio stream stopped.');
+      return;
     }
   });
 
