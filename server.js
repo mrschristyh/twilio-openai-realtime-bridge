@@ -8,8 +8,8 @@ const server = http.createServer(app);
 const PORT = process.env.PORT || 10000;
 
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
-const OPENAI_MODEL = process.env.OPENAI_REALTIME_MODEL || 'gpt-4o-realtime-preview';
-const OPENAI_VOICE = process.env.OPENAI_VOICE || 'alloy';
+const OPENAI_MODEL   = process.env.OPENAI_REALTIME_MODEL || 'gpt-4o-realtime-preview';
+const OPENAI_VOICE   = process.env.OPENAI_VOICE || 'alloy';
 
 if (!OPENAI_API_KEY) {
   console.error('❌ Missing OPENAI_API_KEY env var');
@@ -17,47 +17,47 @@ if (!OPENAI_API_KEY) {
 
 app.get('/', (_req, res) => res.send('OK'));
 
-// --- WebSocket for Twilio ----------------------------------------------------
+/* ------------------------------------------------------------------ */
+/* WebSocket server for Twilio                                        */
+/* ------------------------------------------------------------------ */
+
 const wss = new WebSocketServer({
   server,
   path: '/stream',
+  // Twilio requires this subprotocol:
   handleProtocols: (protocols) => {
     if (protocols && protocols.includes('audio.twilio.com')) return 'audio.twilio.com';
-    return false; // reject non-Twilio
+    return false;
   }
 });
 
 wss.on('connection', (twilioWs, req) => {
   console.log('WS connection from Twilio:', req.url || '');
 
-  // Connect to OpenAI Realtime
+  // Connect to OpenAI Realtime WS
   const openaiWs = new WebSocket(
     `wss://api.openai.com/v1/realtime?model=${encodeURIComponent(OPENAI_MODEL)}`,
-    {
-      headers: {
-        Authorization: `Bearer ${OPENAI_API_KEY}`,
-        'OpenAI-Beta': 'realtime=v1'
-      }
-    }
+    { headers: { Authorization: `Bearer ${OPENAI_API_KEY}`, 'OpenAI-Beta': 'realtime=v1' } }
   );
 
   let framesSinceCommit = 0;
+  let hasBufferedAudio = false;  // track whether we actually appended any audio
   let greeted = false;
   let openaiReady = false;
-  let streamSid = '';
 
-  // --- OpenAI events ---------------------------------------------------------
   openaiWs.on('open', () => {
     console.log('Connected to OpenAI Realtime');
 
-    // Make OpenAI speak μ-law at 8k and listen for μ-law at 8k (no conversions)
+    // ✅ Use mu-law end-to-end so we can pass audio straight through
+    //    (no custom encode/decode needed; 8kHz telephone audio)
     openaiWs.send(JSON.stringify({
       type: 'session.update',
       session: {
-        input_audio_format: 'g711_ulaw',
+        input_audio_format:  'g711_ulaw',
         output_audio_format: 'g711_ulaw',
+        // voice affects output prosody; works with audio+text
         voice: OPENAI_VOICE,
-        // reasonable VAD
+        // Simple VAD so the model knows when to talk
         turn_detection: { type: 'server_vad', silence_duration_ms: 700 },
         instructions: 'You are a friendly real-estate acquisitions assistant. Keep replies short and conversational.'
       }
@@ -65,12 +65,12 @@ wss.on('connection', (twilioWs, req) => {
 
     openaiReady = true;
 
-    // Optional: greet so the caller hears something immediately
+    // Optional: greet so the person hears the AI without needing to speak first
     openaiWs.send(JSON.stringify({
       type: 'response.create',
       response: {
-        modalities: ['audio'],
-        instructions: 'Hi! Thanks for picking up. How can I help with your property today?'
+        modalities: ['audio','text'],  // <-- MUST include both
+        instructions: 'Hello! Thanks for picking up. How can I help regarding your property today?'
       }
     }));
   });
@@ -79,92 +79,66 @@ wss.on('connection', (twilioWs, req) => {
     let evt;
     try { evt = JSON.parse(raw.toString()); } catch { return; }
 
-    // Uncomment to debug everything coming back from OpenAI
-    // console.log('OpenAI event:', evt.type);
-
-    // OpenAI may use either of these keys depending on version
-    // 1) Newer: 'response.output_audio.delta'
-    // 2) Older: 'response.audio.delta'
-    const isDeltaNew = evt.type === 'response.output_audio.delta' && typeof evt.delta === 'string';
-    const isDeltaOld = evt.type === 'response.audio.delta' && typeof evt.delta === 'string';
-
-    if (isDeltaNew || isDeltaOld) {
-      // evt.delta is base64 G.711 μ-law @ 8k
-      const muB64 = evt.delta;
-      try {
-        twilioWs.send(JSON.stringify({
-          event: 'media',
-          media: { payload: muB64 }
-        }));
-      } catch (e) {
-        console.error('Send to Twilio failed:', e);
-      }
+    // Forward OpenAI audio deltas (μ-law base64) straight to Twilio
+    if (evt.type === 'response.output_audio.delta' && evt.delta) {
+      twilioWs.send(JSON.stringify({ event: 'media', media: { payload: evt.delta } }));
     }
 
-    if (evt.type === 'response.created') {
-      // Helpful log to confirm the model is trying to speak
-      console.log('OpenAI: response created');
-    }
-    if (evt.type === 'response.completed') {
-      console.log('OpenAI: response completed');
-    }
-    if (evt.type === 'error') {
-      console.error('OpenAI error:', evt);
-    }
+    // (Optional) logs for debugging:
+    // if (evt.type === 'response.created') console.log('OpenAI: response created');
+    // if (evt.type === 'response.completed') console.log('OpenAI: response completed');
+    // if (evt.type === 'error') console.error('OpenAI error:', evt);
   });
 
   openaiWs.on('error', (e) => console.error('OpenAI WS error:', e));
   openaiWs.on('close', () => console.log('OpenAI WS closed'));
 
-  // --- Twilio events ---------------------------------------------------------
+  // Handle incoming audio from Twilio
   twilioWs.on('message', (msg) => {
     let data;
     try { data = JSON.parse(msg.toString()); } catch { return; }
 
     if (data.event === 'start') {
-      streamSid = data.start?.streamSid || '';
-      console.log('Twilio stream started:', streamSid);
-      return;
+      console.log('Twilio stream started:', data.start?.streamSid);
+      framesSinceCommit = 0;
+      hasBufferedAudio = false;
     }
 
     if (data.event === 'media') {
-      // Twilio sends 20ms frames of base64 μ-law @ 8k
       if (!openaiReady) return;
-
-      // Push μ-law straight into OpenAI
+      // Twilio sends 20ms μ-law frames, base64-encoded, at 8kHz.
+      // We pass them straight to OpenAI.
       openaiWs.send(JSON.stringify({
         type: 'input_audio_buffer.append',
-        audio: data.media.payload    // base64 g711 μ-law
+        audio: data.media.payload
       }));
 
+      hasBufferedAudio = true;
       framesSinceCommit++;
-      if (framesSinceCommit >= 10) { // ~200ms
-        framesSinceCommit = 0;
 
-        // Commit the buffer so the model can process it
+      // Commit roughly every 10 frames (~200ms) to keep latency low.
+      if (framesSinceCommit >= 10) {
+        framesSinceCommit = 0;
         openaiWs.send(JSON.stringify({ type: 'input_audio_buffer.commit' }));
 
-        // Kick off a response the first time (if not already greeted)
+        // Trigger the first response after we have some audio, if we didn't greet
         if (!greeted) {
           greeted = true;
           openaiWs.send(JSON.stringify({
             type: 'response.create',
-            response: { modalities: ['audio'] }
+            response: { modalities: ['audio','text'] }
           }));
         }
       }
-      return;
     }
 
     if (data.event === 'mark') {
-      // ignore
-      return;
+      // Not needed, but available if you want markers
     }
 
     if (data.event === 'stop') {
-      console.log('Twilio stream stopped:', streamSid);
+      console.log('Twilio stream stopped:', data.stop?.streamSid || '');
       try { openaiWs.close(); } catch {}
-      return;
     }
   });
 
