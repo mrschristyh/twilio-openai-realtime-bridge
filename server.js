@@ -40,9 +40,9 @@ wss.on('connection', (twilioWs, req) => {
   let greeted = false;
   let sentAnyOpenAiAudio = false;
   let keepAliveTimer = null;
+  let oaAudioChunks = 0;
 
-  // Pre-computed μ-law 20ms silence frame (8 kHz * 0.02s = 160 samples)
-  // μ-law "silence" byte is 0xFF; base64 that to ship to Twilio.
+  // μ-law 20ms "silence" (160 samples of 0xFF at 8 kHz)
   const SILENCE_BASE64 = Buffer.alloc(160, 0xFF).toString('base64');
   const startKeepAlive = () => {
     if (keepAliveTimer) return;
@@ -54,14 +54,16 @@ wss.on('connection', (twilioWs, req) => {
   };
   const stopKeepAlive = () => { if (keepAliveTimer) { clearInterval(keepAliveTimer); keepAliveTimer = null; } };
 
-  const sendGreeting = () => {
+  const sendGreeting = (why='') => {
     if (!openaiReady || greeted) return;
     greeted = true;
+    console.log('Triggering greeting', why ? `(${why})` : '');
     openaiWs.send(JSON.stringify({
       type: 'response.create',
       response: {
         modalities: ['audio','text'],
-        instructions: 'Hello! Thanks for picking up. How can I help regarding your property today?'
+        // short, to prove audio flows
+        instructions: 'Hello! This is the real-estate assistant. Can you hear me okay?',
       }
     }));
   };
@@ -69,6 +71,7 @@ wss.on('connection', (twilioWs, req) => {
   openaiWs.on('open', () => {
     console.log('Connected to OpenAI Realtime');
 
+    // Configure session for μ-law passthrough
     openaiWs.send(JSON.stringify({
       type: 'session.update',
       session: {
@@ -81,25 +84,33 @@ wss.on('connection', (twilioWs, req) => {
     }));
 
     openaiReady = true;
-    // Kick off greeting ASAP (Twilio might still be starting)
-    sendGreeting();
+    sendGreeting('on open');
   });
 
   openaiWs.on('message', (raw) => {
     let evt;
     try { evt = JSON.parse(raw.toString()); } catch { return; }
 
+    // Log key events so we can see what’s happening
+    if (evt.type === 'response.created') {
+      console.log('OpenAI: response created');
+    } else if (evt.type === 'response.completed') {
+      console.log('OpenAI: response completed');
+    } else if (evt.type === 'error') {
+      console.error('OpenAI error:', evt);
+    }
+
+    // OpenAI audio deltas (μ-law base64) come as response.output_audio.delta
     if (evt.type === 'response.output_audio.delta' && evt.delta) {
-      sentAnyOpenAiAudio = true;     // stop keepalive once model speaks
+      oaAudioChunks++;
+      if (oaAudioChunks % 5 === 0) console.log('OpenAI audio chunks:', oaAudioChunks);
+      sentAnyOpenAiAudio = true;
       stopKeepAlive();
       if (twilioWs.readyState === WebSocket.OPEN) {
+        // Forward μ-law base64 straight to Twilio
         twilioWs.send(JSON.stringify({ event: 'media', media: { payload: evt.delta } }));
       }
     }
-
-    // Optional debug:
-    // if (evt.type === 'response.created') console.log('OpenAI: response created');
-    // if (evt.type === 'error') console.error('OpenAI error:', evt);
   });
 
   openaiWs.on('error', (e) => console.error('OpenAI WS error:', e));
@@ -113,26 +124,22 @@ wss.on('connection', (twilioWs, req) => {
       console.log('Twilio stream started:', data.start?.streamSid);
       framesSinceCommit = 0;
       sentAnyOpenAiAudio = false;
-      startKeepAlive();     // keep call open until model audio flows
-      // If OpenAI is already ready, (re)send greeting now
-      sendGreeting();
+      oaAudioChunks = 0;
+      startKeepAlive();
+      // in case OpenAI was ready first
+      sendGreeting('on twilio start');
     }
 
     if (data.event === 'media') {
       if (!openaiReady) return;
-      // Append Twilio μ-law 20ms frame to OpenAI buffer
-      openaiWs.send(JSON.stringify({
-        type: 'input_audio_buffer.append',
-        audio: data.media.payload
-      }));
+      // append Twilio μ-law frames to OpenAI input buffer
+      openaiWs.send(JSON.stringify({ type: 'input_audio_buffer.append', audio: data.media.payload }));
       framesSinceCommit++;
-
       if (framesSinceCommit >= 10) {
         framesSinceCommit = 0;
         openaiWs.send(JSON.stringify({ type: 'input_audio_buffer.commit' }));
-
-        // If we haven’t greeted (e.g., no human speech yet), create a response
-        if (!greeted) sendGreeting();
+        // if somehow we still didn’t greet, do it
+        if (!greeted) sendGreeting('after commit');
       }
     }
 
