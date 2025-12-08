@@ -15,8 +15,15 @@ if (!OPENAI_API_KEY) console.error('❌ Missing OPENAI_API_KEY env var');
 
 app.get('/', (_req, res) => res.send('OK'));
 
-/* ---------- Twilio WS (g711 μ-law end-to-end) ---------- */
+/* ---------- μ-law tools ---------- */
+// 20ms μ-law frame at 8kHz = 160 bytes. 0xFF ≈ silence.
+const ULawSilence20ms = Buffer.alloc(160, 0xFF).toString('base64');
+function ulawSilenceMs(ms = 120) {
+  const frames = Math.ceil(ms / 20);
+  return Array.from({ length: frames }, () => ULawSilence20ms);
+}
 
+/* ---------- WS for Twilio ---------- */
 const wss = new WebSocketServer({
   server,
   path: '/stream',
@@ -29,41 +36,40 @@ const wss = new WebSocketServer({
 wss.on('connection', (twilioWs, req) => {
   console.log('WS connection from Twilio:', req.url || '');
 
-  // Connect to OpenAI Realtime
   const openaiWs = new WebSocket(
     `wss://api.openai.com/v1/realtime?model=${encodeURIComponent(OPENAI_MODEL)}`,
     { headers: { Authorization: `Bearer ${OPENAI_API_KEY}`, 'OpenAI-Beta': 'realtime=v1' } }
   );
 
-  let framesSinceCommit = 0;
   let openaiReady = false;
   let greeted = false;
   let sentAnyOpenAiAudio = false;
   let keepAliveTimer = null;
-  let oaAudioChunks = 0;
 
-  // μ-law 20ms "silence" (160 samples of 0xFF at 8 kHz)
-  const SILENCE_BASE64 = Buffer.alloc(160, 0xFF).toString('base64');
+  // Counters for logs
+  let twilioFrames = 0;
+  let openaiAudioChunks = 0;
+
+  // μ-law keepalive to Twilio so call doesn’t drop before model speaks
   const startKeepAlive = () => {
     if (keepAliveTimer) return;
     keepAliveTimer = setInterval(() => {
-      if (twilioWs.readyState === WebSocket.OPEN && !sentAnyOpenAiAudio) {
-        twilioWs.send(JSON.stringify({ event: 'media', media: { payload: SILENCE_BASE64 } }));
+      if (!sentAnyOpenAiAudio && twilioWs.readyState === WebSocket.OPEN) {
+        twilioWs.send(JSON.stringify({ event: 'media', media: { payload: ULawSilence20ms } }));
       }
     }, 250);
   };
   const stopKeepAlive = () => { if (keepAliveTimer) { clearInterval(keepAliveTimer); keepAliveTimer = null; } };
 
-  const sendGreeting = (why='') => {
+  const sendGreeting = (tag='') => {
     if (!openaiReady || greeted) return;
     greeted = true;
-    console.log('Triggering greeting', why ? `(${why})` : '');
+    console.log('Triggering greeting', tag ? `(${tag})` : '');
     openaiWs.send(JSON.stringify({
       type: 'response.create',
       response: {
         modalities: ['audio','text'],
-        // short, to prove audio flows
-        instructions: 'Hello! This is the real-estate assistant. Can you hear me okay?',
+        instructions: 'Hello! This is the real-estate assistant. Can you hear me okay?'
       }
     }));
   };
@@ -71,7 +77,7 @@ wss.on('connection', (twilioWs, req) => {
   openaiWs.on('open', () => {
     console.log('Connected to OpenAI Realtime');
 
-    // Configure session for μ-law passthrough
+    // Use μ-law pass-through both directions
     openaiWs.send(JSON.stringify({
       type: 'session.update',
       session: {
@@ -83,6 +89,14 @@ wss.on('connection', (twilioWs, req) => {
       }
     }));
 
+    // ✅ Prime OpenAI with 120ms of silence so the first commit is never empty
+    const silentFrames = ulawSilenceMs(120);
+    for (const b64 of silentFrames) {
+      openaiWs.send(JSON.stringify({ type: 'input_audio_buffer.append', audio: b64 }));
+    }
+    openaiWs.send(JSON.stringify({ type: 'input_audio_buffer.commit' }));
+    console.log('Primed OpenAI with 120ms silence & committed');
+
     openaiReady = true;
     sendGreeting('on open');
   });
@@ -91,7 +105,6 @@ wss.on('connection', (twilioWs, req) => {
     let evt;
     try { evt = JSON.parse(raw.toString()); } catch { return; }
 
-    // Log key events so we can see what’s happening
     if (evt.type === 'response.created') {
       console.log('OpenAI: response created');
     } else if (evt.type === 'response.completed') {
@@ -100,14 +113,12 @@ wss.on('connection', (twilioWs, req) => {
       console.error('OpenAI error:', evt);
     }
 
-    // OpenAI audio deltas (μ-law base64) come as response.output_audio.delta
     if (evt.type === 'response.output_audio.delta' && evt.delta) {
-      oaAudioChunks++;
-      if (oaAudioChunks % 5 === 0) console.log('OpenAI audio chunks:', oaAudioChunks);
+      openaiAudioChunks++;
+      if (openaiAudioChunks % 5 === 0) console.log('OpenAI audio chunks:', openaiAudioChunks);
       sentAnyOpenAiAudio = true;
       stopKeepAlive();
       if (twilioWs.readyState === WebSocket.OPEN) {
-        // Forward μ-law base64 straight to Twilio
         twilioWs.send(JSON.stringify({ event: 'media', media: { payload: evt.delta } }));
       }
     }
@@ -122,24 +133,25 @@ wss.on('connection', (twilioWs, req) => {
 
     if (data.event === 'start') {
       console.log('Twilio stream started:', data.start?.streamSid);
-      framesSinceCommit = 0;
+      twilioFrames = 0;
+      openaiAudioChunks = 0;
       sentAnyOpenAiAudio = false;
-      oaAudioChunks = 0;
       startKeepAlive();
-      // in case OpenAI was ready first
       sendGreeting('on twilio start');
     }
 
     if (data.event === 'media') {
+      // Count Twilio frames to confirm inbound audio is arriving
+      twilioFrames++;
+      if (twilioFrames % 10 === 0) console.log('Twilio frames received:', twilioFrames);
+
       if (!openaiReady) return;
-      // append Twilio μ-law frames to OpenAI input buffer
+      // Append inbound μ-law frame into OpenAI buffer
       openaiWs.send(JSON.stringify({ type: 'input_audio_buffer.append', audio: data.media.payload }));
-      framesSinceCommit++;
-      if (framesSinceCommit >= 10) {
-        framesSinceCommit = 0;
+
+      // Commit every ~200ms (10 * 20ms) *only if we actually got frames*
+      if (twilioFrames % 10 === 0) {
         openaiWs.send(JSON.stringify({ type: 'input_audio_buffer.commit' }));
-        // if somehow we still didn’t greet, do it
-        if (!greeted) sendGreeting('after commit');
       }
     }
 
